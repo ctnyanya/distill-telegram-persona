@@ -1,0 +1,21 @@
+# 敏感配置
+.env
+config.yaml
+*.session
+bot.log
+
+# 数据目录（聊天记录、分析结果、skill 文件）
+data/
+
+# 测试文件（依赖本地数据）
+test_persona.py
+test_replay.py
+test_thinking.py
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Claude Code 本地设置
+.claude/settings.local.json

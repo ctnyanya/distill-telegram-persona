@@ -1,0 +1,56 @@
+telegram:
+  api_id: 12345
+  api_hash: "your_api_hash"
+  # 首次运行会要求输入手机号和验证码，之后 session 会缓存到本地
+
+target:
+  user_name: "张三"  # 蒸馏目标的显示名（用于输出标识）
+  user_id: 123456789  # 目标用户 ID（可选，自蒸馏时需显式指定）
+
+  # 要采集的聊天列表，支持私聊和群聊混合
+  # 可以用 chat_id（数字）或 username（字符串）
+  chats:
+    - chat_id: 123456789       # 私聊：对方的 user_id
+      type: private
+    - chat_id: -1001234567890  # 群聊：群组 ID
+      type: group
+
+exporter:
+  output_dir: "data/张三"  # 输出目录，换人蒸馏时改这里
+  download_media: true     # 是否下载媒体文件，false 则只记录元数据
+  # 每个聊天最多拉取的消息数，0 表示不限制
+  max_messages: 0
+  context_radius: 15  # 群聊中目标用户每条消息前后拉取的消息数
+  # 时间范围过滤（可选，留空表示不限）
+  # date_from: "2022-01-01"
+  # date_to: "2026-04-01"
+
+distill:
+  model: "claude-sonnet-4-6-20250514"
+  max_sample_conversations: 200
+
+bot:
+  token: "BOT_TOKEN"  # 或设置环境变量 BOT_TOKEN
+  skill_dir: "data/张三/skill"  # skill 文件目录
+  model: "gemini-2.5-flash"
+  allowed_users: []   # 私聊白名单，填用户 ID，空列表=不限制
+  allowed_groups: []  # 群聊白名单，填群 chat_id（负数），空列表=不限制
+  trigger:
+    on_mention: true
+    on_reply: true
+    random_probability: 0.05
+    keywords: ["张三", "老张"]
+    photo_trigger:
+      user_ids: []        # 指定用户发图时触发，填用户 ID
+      probability: 0.5    # 触发概率
+  proactive:
+    enabled: false
+    interval_minutes: 15    # 每隔多少分钟检查一次
+    probability: 0.4        # 每次检查时发言的概率
+    min_new_messages: 5     # buffer 中至少有多少条新消息才考虑发言
+  context_window: 20
+  max_tokens: 150
+  max_tool_rounds: 2        # lookup 工具最大调用轮数
+  thinking_budget: 0        # extended thinking token budget，0=禁用
+  cooldown_seconds: 60
+  active_hours: [9, 23]     # 活跃时段（24 小时制）
