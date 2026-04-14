@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import random
+import re as _re
 import time
 from io import BytesIO
 from pathlib import Path
@@ -375,23 +376,82 @@ async def send_to_chat(chat_id: int, reply_text: str) -> None:
             break
 
 
+_URL_ONLY_RE = _re.compile(r'^https?://\S+$')
+
+
+def _filter_context(messages: list[dict]) -> list[dict]:
+    """Filter noise from context messages to improve LLM focus."""
+    filtered = []
+    for m in messages:
+        fmt = m["formatted"]
+        is_bot = m.get("is_bot", False)
+
+        # Extract content after "[name]: "
+        colon_idx = fmt.find("]: ")
+        content = fmt[colon_idx + 3:] if colon_idx != -1 else fmt
+
+        # Skip pure sticker messages (keep bot's own)
+        if not is_bot and _re.match(r'^\[sticker:.+\]$', content):
+            continue
+
+        # Skip no-caption images
+        if not is_bot and content == "[发了一张图片]":
+            continue
+
+        # Skip pure media
+        if not is_bot and content == "[media]":
+            continue
+
+        # Skip pure URLs
+        if not is_bot and _URL_ONLY_RE.match(content.strip()):
+            continue
+
+        # Truncate long messages
+        if len(content) > 200:
+            truncated = content[:200] + "...（省略）"
+            m = dict(m)  # don't mutate original
+            m["formatted"] = fmt[:colon_idx + 3] + truncated if colon_idx != -1 else truncated
+
+        filtered.append(m)
+    return filtered
+
+
 async def build_llm_messages(trigger_msg: str | None = None) -> list[dict]:
-    recent = message_buffer[-CONTEXT_WINDOW:]
-    lines = [m["formatted"] for m in recent]
+    recent = _filter_context(message_buffer[-CONTEXT_WINDOW:])
+
+    lines = []
+    prev_time = None
+    for m in recent:
+        # Insert time gap separator (>30 min)
+        cur_time = m.get("time", 0)
+        if prev_time and cur_time - prev_time > 1800:
+            lines.append("--- (时间间隔) ---")
+        prev_time = cur_time
+
+        # Prefix bot's own messages
+        fmt = m["formatted"]
+        if m.get("is_bot"):
+            fmt = f"[你之前的回复] {fmt}"
+        lines.append(fmt)
+
     chat_log = "\n".join(lines)
 
     if trigger_msg:
         instruction = (
             f"以下是群聊中最近的消息：\n\n{chat_log}\n\n"
-            f"触发你回复的是这条消息：「{trigger_msg}」\n"
-            f"请以{TARGET_NAME}的身份针对这条消息回复。"
-            f"直接输出{TARGET_NAME}会说的话，不要加任何前缀或角色标签。"
+            f"触发你回复的是这条消息：「{trigger_msg}」\n\n"
+            f"## 重要规则\n"
+            f"- 只回复触发消息涉及的话题，忽略聊天记录中的其他话题\n"
+            f"- 不要重复「你之前的回复」中说过的内容\n"
+            f"- 直接输出{TARGET_NAME}会说的话，不要加任何前缀或角色标签"
         )
     else:
         instruction = (
             f"以下是群聊中最近的消息：\n\n{chat_log}\n\n"
-            f"请以{TARGET_NAME}的身份回复最近的话题。"
-            f"直接输出{TARGET_NAME}会说的话，不要加任何前缀或角色标签。"
+            f"## 重要规则\n"
+            f"- 只回复最后一条「--- (时间间隔) ---」分隔线之后的话题\n"
+            f"- 不要重复「你之前的回复」中说过的内容\n"
+            f"- 直接输出{TARGET_NAME}会说的话，不要加任何前缀或角色标签"
         )
 
     content: list[dict] = [{"type": "text", "text": instruction}]
@@ -502,6 +562,7 @@ async def on_group_message(msg: Message) -> None:
             "formatted": f"[{TARGET_NAME}]: {reply_text}",
             "photo_file_id": None,
             "time": time.time(),
+            "is_bot": True,
         })
 
         last_reply_time = time.time()
@@ -640,6 +701,7 @@ async def proactive_loop() -> None:
                 "formatted": f"[{TARGET_NAME}]: {reply_text}",
                 "photo_file_id": None,
                 "time": time.time(),
+                "is_bot": True,
             })
 
             last_reply_time = time.time()

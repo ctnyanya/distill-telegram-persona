@@ -7,6 +7,7 @@
 断点续传：每个聊天的进度独立保存，中断后重跑自动跳过已完成的部分
 """
 
+import argparse
 import asyncio
 import json
 import sys
@@ -386,7 +387,79 @@ async def export_group_chat(client: TelegramClient, chat_config: dict, target_us
     return messages
 
 
+async def export_group_full(client: TelegramClient, chat_config: dict, config: dict, dirs: dict) -> list[dict]:
+    """全量导出群聊记录（不按目标用户过滤）。"""
+    chat_id = chat_config["chat_id"]
+
+    if is_chat_done(dirs["progress"], chat_id):
+        _, messages = load_progress(dirs["progress"], chat_id)
+        print(f"\n群聊(全量) {chat_id} 已完成，加载 {len(messages)} 条缓存消息")
+        return messages
+
+    print(f"\n正在连接群聊 {chat_id}（全量模式）...")
+    try:
+        entity = await client.get_entity(chat_id)
+    except Exception as e:
+        print(f"  无法访问聊天 {chat_id}: {e}")
+        return []
+
+    chat_name = get_sender_name(entity)
+    print(f"  聊天名称: {chat_name}")
+
+    total = (await client.get_messages(entity, limit=0)).total
+    print(f"  总消息数: {total}")
+
+    exporter_config = config.get("exporter", {})
+    max_messages = exporter_config.get("max_messages", 0) or None
+    date_from = exporter_config.get("date_from")
+    date_to = exporter_config.get("date_to")
+
+    offset_date = None
+    if date_to:
+        offset_date = datetime.fromisoformat(date_to).replace(tzinfo=timezone.utc)
+
+    existing_ids, messages = load_progress(dirs["progress"], chat_id)
+    if existing_ids:
+        print(f"  从断点继续，已有 {len(existing_ids)} 条消息")
+
+    pbar_total = min(max_messages, total) if max_messages else total
+    pbar = tqdm(total=pbar_total, desc=f"群聊(全量) {chat_name}", unit="条", initial=len(existing_ids))
+
+    async for message in client.iter_messages(entity, limit=max_messages, offset_date=offset_date):
+        if date_from:
+            msg_date = message.date.replace(tzinfo=timezone.utc) if message.date.tzinfo is None else message.date
+            if msg_date < datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc):
+                break
+
+        if message.id in existing_ids:
+            pbar.update(1)
+            continue
+
+        msg_data = await build_message_data(client, message, chat_id, chat_name, "group", dirs["media"], dirs["download"])
+        if msg_data:
+            messages.append(msg_data)
+            append_progress(dirs["progress"], chat_id, msg_data)
+        pbar.update(1)
+
+    pbar.close()
+    mark_chat_done(dirs["progress"], chat_id)
+    print(f"  采集到 {len(messages)} 条有效消息")
+    return messages
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Telegram 聊天记录导出工具")
+    parser.add_argument("--full", action="store_true",
+                        help="群聊全量导出模式（忽略 target_user_id，下载所有消息）")
+    parser.add_argument("--output-dir",
+                        help="输出目录（覆盖 config.yaml 中的 output_dir）")
+    parser.add_argument("--chat", type=int, action="append",
+                        help="只导出指定 chat_id（可多次使用），不指定则导出 config 中所有聊天")
+    return parser.parse_args()
+
+
 async def main():
+    args = parse_args()
     config = load_config()
 
     api_id = config["telegram"]["api_id"]
@@ -394,7 +467,18 @@ async def main():
     target_name = config["target"]["user_name"]
     chats = config["target"]["chats"]
 
-    output_dir = Path(config["exporter"].get("output_dir", f"data/{target_name}"))
+    # --chat 过滤：只保留指定的 chat_id
+    if args.chat:
+        chat_filter = set(args.chat)
+        chats = [c for c in chats if c["chat_id"] in chat_filter]
+        if not chats:
+            print(f"错误：--chat 指定的 ID {args.chat} 在 config.yaml 的 chats 中未找到")
+            sys.exit(1)
+
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    else:
+        output_dir = Path(config["exporter"].get("output_dir", f"data/{target_name}"))
     media_dir = output_dir / "media"
     progress_dir = output_dir / "progress"
 
@@ -407,6 +491,8 @@ async def main():
 
     print(f"蒸馏目标: {target_name}")
     print(f"输出目录: {output_dir}")
+    if args.full:
+        print(f"模式: 群聊全量导出")
     print(f"待采集聊天数: {len(chats)}")
 
     client = TelegramClient(SESSION_FILE, api_id, api_hash)
@@ -425,8 +511,13 @@ async def main():
     all_messages = []
     for chat_config in chats:
         chat_type = chat_config.get("type", "group")
+        # --full 强制所有 group 类型走全量导出
+        if args.full and chat_type in ("group", "group_full"):
+            chat_type = "group_full"
         if chat_type == "private":
             msgs = await export_private_chat(client, chat_config, config, dirs)
+        elif chat_type == "group_full":
+            msgs = await export_group_full(client, chat_config, config, dirs)
         else:
             if not target_user_id:
                 print(f"  跳过群聊 {chat_config['chat_id']}：未配置 target_user_id")

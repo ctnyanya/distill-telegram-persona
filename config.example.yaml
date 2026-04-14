@@ -12,8 +12,10 @@ target:
   chats:
     - chat_id: 123456789       # 私聊：对方的 user_id
       type: private
-    - chat_id: -1001234567890  # 群聊：群组 ID
+    - chat_id: -1001234567890  # 群聊：群组 ID（只采集目标用户 ± context_radius）
       type: group
+    # - chat_id: -1001234567890  # 群聊全量导出（采集所有消息）
+    #   type: group_full
 
 exporter:
   output_dir: "data/张三"  # 输出目录，换人蒸馏时改这里

@@ -270,6 +270,27 @@ async def _openai_compat(
     resp = await client.chat.completions.create(**kwargs)
     msg = resp.choices[0].message
 
+    # Log reasoning/thinking content if present
+    reasoning = getattr(msg, 'reasoning_content', None) or getattr(msg, 'reasoning', None)
+    if reasoning:
+        log.info("Reasoning content (%d chars): %s", len(reasoning), reasoning[:300])
+
+    # Log token usage
+    if resp.usage:
+        parts = []
+        if getattr(resp.usage, 'prompt_tokens', None) is not None:
+            parts.append(f"prompt={resp.usage.prompt_tokens}")
+        if getattr(resp.usage, 'completion_tokens', None) is not None:
+            parts.append(f"completion={resp.usage.completion_tokens}")
+        if getattr(resp.usage, 'total_tokens', None) is not None:
+            parts.append(f"total={resp.usage.total_tokens}")
+        # Some APIs report reasoning tokens separately
+        reasoning_tokens = getattr(resp.usage, 'completion_tokens_details', None)
+        if reasoning_tokens and getattr(reasoning_tokens, 'reasoning_tokens', None):
+            parts.append(f"reasoning={reasoning_tokens.reasoning_tokens}")
+        if parts:
+            log.info("Token usage: %s", " ".join(parts))
+
     tool_calls: list[ToolCall] = []
     if msg.tool_calls:
         for tc in msg.tool_calls:
@@ -280,6 +301,12 @@ async def _openai_compat(
             ))
 
     text = msg.content or ""
+
+    # Strip leaked <think> tags from reasoning models
+    think_match = re.match(r'<think>.*?</think>\s*', text, re.DOTALL)
+    if think_match:
+        log.warning("Stripped leaked <think> block (%d chars)", len(think_match.group()))
+        text = text[think_match.end():]
 
     # Fallback: if API returned no tool_calls, try parsing from text
     if not tool_calls and tools:

@@ -13,22 +13,32 @@ STICKER_MAP: dict[str, list[Path]] = {}
 
 
 def load_stickers(skill_dir: Path) -> None:
-    """Load sticker mapping from stats.json's top_stickers field.
+    """Load sticker mapping from stickers/map.json, falling back to stats.json.
 
     Args:
-        skill_dir: Path to the skill directory. stats.json is expected
-                   in its parent directory.
+        skill_dir: Path to the skill directory.
     """
+    STICKER_MAP.clear()
+    root = Path(__file__).resolve().parent.parent
+
+    # Primary: stickers/map.json (emoji → filename)
+    map_file = skill_dir / "stickers" / "map.json"
+    if map_file.exists():
+        mapping = json.loads(map_file.read_text(encoding="utf-8"))
+        sticker_dir = map_file.parent
+        for emoji, filename in mapping.items():
+            p = sticker_dir / filename
+            if p.exists():
+                STICKER_MAP.setdefault(emoji, []).append(p)
+        return
+
+    # Fallback: stats.json top_stickers
     stats_file = skill_dir.parent / "stats.json"
     if not stats_file.exists():
         return
 
     stats = json.loads(stats_file.read_text(encoding="utf-8"))
-    top_stickers = stats.get("top_stickers", [])
-
-    STICKER_MAP.clear()
-    root = Path(__file__).resolve().parent.parent
-    for entry in top_stickers:
+    for entry in stats.get("top_stickers", []):
         emoji = entry.get("emoji")
         path_str = entry.get("path")
         if not emoji or not path_str:
