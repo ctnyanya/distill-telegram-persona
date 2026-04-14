@@ -1,0 +1,11 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+*.session
+.env
+bot.log
+tests/
+data/*/media/
+data/*/progress/
+data/*/raw/

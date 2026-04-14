@@ -322,6 +322,13 @@ async def send_reply(msg: Message, reply_text: str) -> None:
                 sent += 1
                 await asyncio.sleep(random.uniform(0.5, 1.5))
                 continue
+        # Fallback: bare emoji that has a sticker mapping
+        path = find_sticker(line)
+        if path:
+            await msg.answer_sticker(FSInputFile(path))
+            sent += 1
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            continue
         # Check for inline sticker tags mixed with text
         parts = STICKER_RE.split(line)
         for i, part in enumerate(parts):
@@ -357,6 +364,13 @@ async def send_to_chat(chat_id: int, reply_text: str) -> None:
                 sent += 1
                 await asyncio.sleep(random.uniform(0.5, 1.5))
                 continue
+        # Fallback: bare emoji that has a sticker mapping
+        path = find_sticker(line)
+        if path:
+            await tg.send_sticker(chat_id, FSInputFile(path))
+            sent += 1
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            continue
         parts = STICKER_RE.split(line)
         for i, part in enumerate(parts):
             part = part.strip()
