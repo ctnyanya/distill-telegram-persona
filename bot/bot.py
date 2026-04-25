@@ -57,6 +57,30 @@ MAX_TOOL_ROUNDS = bot_cfg.get("max_tool_rounds", 2)
 THINKING_BUDGET = bot_cfg.get("thinking_budget", 0)
 PROACTIVE = bot_cfg.get("proactive", {})
 
+# ── RAG ─────────────────────────────────────────────────────────────────────
+
+RAG_CFG = cfg.get("rag", {}) or {}
+RAG_ENABLED = RAG_CFG.get("enabled", False)
+RAG_HIST_K = RAG_CFG.get("historical_k", 3)
+RAG_RUNTIME_K = RAG_CFG.get("runtime_k", 2)
+RAG_WRITE_RUNTIME = RAG_CFG.get("write_runtime", True)
+
+retriever = None  # type: "Retriever | None"  # noqa: F821
+if RAG_ENABLED:
+    from bot.rag.embedder import Embedder
+    from bot.rag.retriever import Retriever
+    from bot.rag.store import Store
+
+    _rag_db = ROOT / RAG_CFG.get("db_path", "data/target/rag.db")
+    _rag_mode = RAG_CFG.get("runtime_mode", "vector")
+    _rag_store = Store(_rag_db)
+    _rag_embedder = Embedder() if _rag_mode == "vector" else None
+    retriever = Retriever(_rag_store, _rag_embedder, mode=_rag_mode)
+    log.info(
+        "[rag] enabled mode=%s hist=%d runtime=%d db=%s",
+        _rag_mode, RAG_HIST_K, RAG_RUNTIME_K, _rag_db,
+    )
+
 # ── skill loading ───────────────────────────────────────────────────────────
 
 
@@ -430,7 +454,43 @@ def _filter_context(messages: list[dict]) -> list[dict]:
     return filtered
 
 
-async def build_llm_messages(trigger_msg: str | None = None) -> list[dict]:
+async def _retrieve_for_query(query: str) -> str:
+    """Run RAG retrieval for the given query and render to prompt fragment.
+
+    Returns "" when RAG is disabled, query is empty, or nothing was found.
+    """
+    if not retriever or not query or not query.strip():
+        return ""
+    t0 = time.time()
+    hist, runtime = await retriever.retrieve_async(query, RAG_HIST_K, RAG_RUNTIME_K)
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    def _summary(chunks: list) -> list[tuple]:
+        return [(c.id, round(getattr(c, "_score", 0.0), 3)) for c in chunks]
+
+    log.info(
+        "[rag] q=%r hist=%s runtime=%s elapsed_ms=%d",
+        query[:40], _summary(hist), _summary(runtime), elapsed_ms,
+    )
+    return retriever.format_for_prompt(hist, runtime)
+
+
+def _extract_text(content) -> str:
+    """Pull plain text out of a string-or-multimodal-list message content."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(p.get("text", ""))
+        return "\n".join(parts)
+    return ""
+
+
+async def build_llm_messages(
+    trigger_msg: str | None = None, retrieved: str = ""
+) -> list[dict]:
     recent = _filter_context(message_buffer[-CONTEXT_WINDOW:])
 
     lines = []
@@ -467,6 +527,9 @@ async def build_llm_messages(trigger_msg: str | None = None) -> list[dict]:
             f"- 不要重复「你之前的回复」中说过的内容\n"
             f"- 直接输出{TARGET_NAME}会说的话，不要加任何前缀或角色标签"
         )
+
+    if retrieved:
+        instruction = retrieved + "\n\n---\n\n" + instruction
 
     content: list[dict] = [{"type": "text", "text": instruction}]
 
@@ -562,7 +625,12 @@ async def on_group_message(msg: Message) -> None:
         # Collect user IDs from recent messages for people profile injection
         active_uids = {m["from_id"] for m in message_buffer[-CONTEXT_WINDOW:]}
         trigger_text = format_msg(msg)
-        reply_text = await generate_reply(await build_llm_messages(trigger_text), SYSTEM_PROMPT, active_uids)
+        # Use the raw trigger text (no [name]: prefix) as the RAG query.
+        retrieved = await _retrieve_for_query(msg.text or msg.caption or "")
+        reply_text = await generate_reply(
+            await build_llm_messages(trigger_text, retrieved=retrieved),
+            SYSTEM_PROMPT, active_uids,
+        )
         reply_text = reply_text.strip()
         if not reply_text:
             return
@@ -582,6 +650,16 @@ async def on_group_message(msg: Message) -> None:
         last_reply_time = time.time()
         log.info("Replied: %s", reply_text[:80])
         msg_log.info("[群聊·发] %s", reply_text)
+
+        if retriever and RAG_WRITE_RUNTIME:
+            # buffer[-1] = bot reply, buffer[-2] = trigger, buffer[-4:-2] = 2 prior msgs
+            from bot.rag.chunker import chunk_runtime
+            ctx_lines = [m["formatted"] for m in message_buffer[-4:-2]]
+            trigger_line = message_buffer[-2]["formatted"]
+            chunk = chunk_runtime(
+                ctx_lines, trigger_line, reply_text, TARGET_NAME, msg.chat.id,
+            )
+            asyncio.create_task(retriever.add_runtime_async(chunk))
     except Exception:
         log.exception("LLM call failed")
 
@@ -648,7 +726,43 @@ async def on_private_message(msg: Message) -> None:
     msg_log.info("[私聊·收·%s] %s", chat_id, text)
 
     try:
-        reply_text = await generate_reply(list(history), SYSTEM_PROMPT, {msg.from_user.id} if msg.from_user else None)
+        # Fork before injection: retrieved fragment must not pollute history
+        # (otherwise it gets re-prepended every turn and tokens balloon).
+        messages_for_llm = list(history)
+        if retriever and text:
+            retrieved = await _retrieve_for_query(text)
+            if retrieved:
+                last = dict(messages_for_llm[-1])
+                last_content = last["content"]
+                if isinstance(last_content, str):
+                    last["content"] = retrieved + "\n\n---\n\n" + last_content
+                else:
+                    new_content = list(last_content)
+                    text_idx = next(
+                        (
+                            i for i, p in enumerate(new_content)
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ),
+                        None,
+                    )
+                    if text_idx is not None:
+                        old = new_content[text_idx]
+                        new_content[text_idx] = {
+                            "type": "text",
+                            "text": retrieved + "\n\n---\n\n" + old.get("text", ""),
+                        }
+                    else:
+                        new_content.insert(
+                            0, {"type": "text", "text": retrieved + "\n\n---\n\n"}
+                        )
+                    last["content"] = new_content
+                messages_for_llm[-1] = last
+
+        reply_text = await generate_reply(
+            messages_for_llm,
+            SYSTEM_PROMPT,
+            {msg.from_user.id} if msg.from_user else None,
+        )
         reply_text = reply_text.strip()
         if not reply_text:
             return
@@ -659,6 +773,26 @@ async def on_private_message(msg: Message) -> None:
 
         log.info("Private reply: %s", reply_text[:80])
         msg_log.info("[私聊·发·%s] %s", chat_id, reply_text)
+
+        if retriever and RAG_WRITE_RUNTIME and text:
+            from bot.rag.chunker import chunk_runtime
+            sender_name = (
+                (msg.from_user.first_name or "用户") if msg.from_user else "用户"
+            )
+            ctx_lines: list[str] = []
+            # history is [..., user_trigger, assistant_reply] now;
+            # the 2 messages before the trigger live at history[-4:-2].
+            for m in history[-4:-2]:
+                role = m["role"]
+                name = TARGET_NAME if role == "assistant" else sender_name
+                body = _extract_text(m["content"])
+                if body:
+                    ctx_lines.append(f"[{name}]: {body}")
+            trigger_line = f"[{sender_name}]: {text}"
+            chunk = chunk_runtime(
+                ctx_lines, trigger_line, reply_text, TARGET_NAME, chat_id,
+            )
+            asyncio.create_task(retriever.add_runtime_async(chunk))
     except Exception:
         log.exception("Private LLM call failed")
 

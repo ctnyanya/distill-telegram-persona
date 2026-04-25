@@ -56,3 +56,11 @@ bot:
   thinking_budget: 0        # extended thinking token budget，0=禁用
   cooldown_seconds: 60
   active_hours: [9, 23]     # 活跃时段（24 小时制）
+
+rag:
+  enabled: false                       # 总开关；false 时 bot 行为退回 Phase 1 之前
+  db_path: "data/张三/rag.db"          # 索引数据库路径，scripts/build_rag_index.py 产物
+  runtime_mode: "vector"               # "vector"（fastembed + 余弦）| "bm25"（FTS5 兜底）
+  historical_k: 3                      # 每次召回的历史 chunk 数
+  runtime_k: 2                         # 每次召回的 runtime chunk 数
+  write_runtime: true                  # 是否把每轮交互写回索引（调试时可关）

@@ -1,0 +1,28 @@
+# === Private repo gitignore for Railway deployment ===
+# 用这个替换 .gitignore 后，skill 文件和 config 可以提交
+
+# 敏感凭证
+.env
+*.session
+
+# 运行时产物
+bot.log
+context/
+
+# 大文件 / 原始数据（不需要部署）
+data/*/media/
+data/*/progress/
+data/*/raw/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Claude Code 本地设置
+.claude/settings.local.json
+
+# 测试文件（依赖本地数据）
+test_persona.py
+test_replay.py
+test_thinking.py
