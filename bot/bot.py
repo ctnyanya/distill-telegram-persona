@@ -243,6 +243,10 @@ last_proactive_buf_len: int = 0   # buffer length at last proactive check
 bot_user_id: int = 0
 bot_username: str = ""
 
+# media_group_id → {"messages": list[Message], "task": asyncio.Task, "first_seen": float}
+pending_media_groups: dict[str, dict] = {}
+MEDIA_GROUP_DEBOUNCE_SECS = 1.5  # how long to wait after last photo before deciding
+
 # ── helpers ─────────────────────────────────────────────────────────────────
 
 
@@ -255,6 +259,11 @@ def is_active_hour() -> bool:
 def should_trigger(msg: Message) -> bool:
     """Decide whether to reply to this message."""
     if not is_active_hour():
+        return False
+
+    # Media-group photos go through the debounce path, not the per-message
+    # probability check — otherwise N photos × 60% means up to N replies.
+    if msg.media_group_id:
         return False
 
     text = msg.text or msg.caption or ""
@@ -583,44 +592,64 @@ tg = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
-@dp.message(F.chat.type.in_({"group", "supergroup"}))
-async def on_group_message(msg: Message) -> None:
-    global last_reply_time, bot_user_id, bot_username
+def _media_group_should_trigger(msg: Message) -> bool:
+    if not is_active_hour():
+        return False
+    if time.time() - last_reply_time < COOLDOWN:
+        return False
+    photo_cfg = TRIGGER.get("photo_trigger", {})
+    if not (photo_cfg and msg.from_user):
+        return False
+    if msg.from_user.id not in photo_cfg.get("user_ids", []):
+        return False
+    return random.random() < photo_cfg.get("probability", 0.5)
 
-    # Group whitelist — if set, ignore messages from unlisted groups
-    if ALLOWED_GROUPS and msg.chat.id not in ALLOWED_GROUPS:
+
+def _enqueue_media_group(msg: Message) -> None:
+    gid = msg.media_group_id
+    entry = pending_media_groups.get(gid)
+    if entry is None:
+        entry = {"messages": [], "task": None, "first_seen": time.time()}
+        pending_media_groups[gid] = entry
+    entry["messages"].append(msg)
+
+    # Reset the debounce timer — every new photo pushes the deadline forward
+    if entry["task"] and not entry["task"].done():
+        entry["task"].cancel()
+    entry["task"] = asyncio.create_task(_handle_media_group(gid))
+
+
+async def _handle_media_group(gid: str) -> None:
+    global last_reply_time
+    try:
+        await asyncio.sleep(MEDIA_GROUP_DEBOUNCE_SECS)
+    except asyncio.CancelledError:
+        return  # superseded by a newer photo in the same group
+
+    entry = pending_media_groups.pop(gid, None)
+    if not entry or not entry["messages"]:
         return
 
-    if not bot_user_id:
-        me = await tg.get_me()
-        bot_user_id = me.id
-        bot_username = me.username or ""
+    last_msg = entry["messages"][-1]
 
-    # Buffer — store file_id for photos and sticker thumbnails
-    photo_id = None
-    if msg.photo:
-        photo_id = msg.photo[-1].file_id
-    elif msg.sticker and msg.sticker.thumbnail:
-        photo_id = msg.sticker.thumbnail.file_id
+    # Do the photo_trigger probability check ONCE for the whole group,
+    # using last_msg as the trigger anchor.
+    if not _media_group_should_trigger(last_msg):
+        return
 
-    message_buffer.append(
-        {
-            "msg_id": msg.message_id,
-            "from_id": msg.from_user.id if msg.from_user else 0,
-            "formatted": format_msg(msg),
-            "photo_file_id": photo_id,
-            "time": time.time(),
-        }
+    # Placeholder lock: claim the cooldown window now, before the LLM
+    # call begins. Otherwise a later non-group photo can race past us.
+    last_reply_time = time.time()
+
+    log.info(
+        "[media-group] gid=%s size=%d → triggering on last msg %d",
+        gid, len(entry["messages"]), last_msg.message_id,
     )
-    if len(message_buffer) > 200:
-        del message_buffer[: len(message_buffer) - 200]
+    await _execute_reply(last_msg)
 
-    if not should_trigger(msg):
-        return
 
-    log.info("Triggered by: %s", (msg.text or msg.caption or ("[photo]" if msg.photo else ""))[:60])
-    msg_log.info("[群聊·收] %s", format_msg(msg))
-
+async def _execute_reply(msg: Message) -> None:
+    global last_reply_time
     try:
         # Collect user IDs from recent messages for people profile injection
         active_uids = {m["from_id"] for m in message_buffer[-CONTEXT_WINDOW:]}
@@ -662,6 +691,55 @@ async def on_group_message(msg: Message) -> None:
             asyncio.create_task(retriever.add_runtime_async(chunk))
     except Exception:
         log.exception("LLM call failed")
+
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}))
+async def on_group_message(msg: Message) -> None:
+    global last_reply_time, bot_user_id, bot_username
+
+    # Group whitelist — if set, ignore messages from unlisted groups
+    if ALLOWED_GROUPS and msg.chat.id not in ALLOWED_GROUPS:
+        return
+
+    if not bot_user_id:
+        me = await tg.get_me()
+        bot_user_id = me.id
+        bot_username = me.username or ""
+
+    # Buffer — store file_id for photos and sticker thumbnails
+    photo_id = None
+    if msg.photo:
+        photo_id = msg.photo[-1].file_id
+    elif msg.sticker and msg.sticker.thumbnail:
+        photo_id = msg.sticker.thumbnail.file_id
+
+    message_buffer.append(
+        {
+            "msg_id": msg.message_id,
+            "from_id": msg.from_user.id if msg.from_user else 0,
+            "formatted": format_msg(msg),
+            "photo_file_id": photo_id,
+            "time": time.time(),
+        }
+    )
+    if len(message_buffer) > 200:
+        del message_buffer[: len(message_buffer) - 200]
+
+    # Media-group dispatch: collect, debounce, decide once when quiet
+    if msg.photo and msg.media_group_id:
+        _enqueue_media_group(msg)
+        return
+
+    if not should_trigger(msg):
+        return
+
+    # Placeholder lock — also fixes the existing race for non-group triggers
+    last_reply_time = time.time()
+
+    log.info("Triggered by: %s", (msg.text or msg.caption or ("[photo]" if msg.photo else ""))[:60])
+    msg_log.info("[群聊·收] %s", format_msg(msg))
+
+    await _execute_reply(msg)
 
 
 # ── private chat ────────────────────────────────────────────────────────────
